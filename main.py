@@ -1,6 +1,7 @@
 import os
 import hashlib
 import json
+import re
 from typing import Optional, Any
 
 from dotenv import load_dotenv
@@ -23,6 +24,10 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "64"))
 
 # fake | openai
 EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "fake").strip().lower()
+
+# RRF params
+RRF_K = int(os.getenv("RRF_K", "60"))                 # constante típica
+RRF_CANDIDATES_MULT = int(os.getenv("RRF_MULT", "5")) # top_k * MULT por cada ranking (lex/sem)
 
 app = FastAPI(title="FastAPI + Milvus (Vector DB)")
 
@@ -55,7 +60,6 @@ def fake_embed(text: str) -> list[float]:
 
     return vec
 
-
 # ---------- OpenAI embeddings (preparado para producción) ----------
 def openai_embed(text: str) -> list[float]:
     """
@@ -85,7 +89,7 @@ def openai_embed(text: str) -> list[float]:
 
     return vec
 
-
+# cambiamos de función dependiendo del método que utilicemos
 def embed(text: str) -> list[float]:
     """
     Punto único de generación de embeddings.
@@ -131,6 +135,126 @@ def get_or_create_collection() -> Collection:
 @app.on_event("startup")
 def startup():
     get_or_create_collection()
+
+
+# ---------- RRF helpers ----------
+def _tokenize(q: str) -> list[str]:
+    # tokens simples: palabras/nums (evita comillas y cosas raras)
+    tokens = re.findall(r"[A-Za-zÀ-ÿ0-9]+", q.lower())
+    # quita tokens muy cortos tipo "a", "y" (opcional)
+    return [t for t in tokens if len(t) >= 2]
+
+
+def _lexical_candidates(col: Collection, query: str, limit: int) -> list[dict]:
+    """
+    Recupera candidatos léxicos en Milvus (expr LIKE).
+    Mejora respecto a tu versión: usa OR por tokens para no depender de la frase exacta.
+    """
+    q_escaped = query.replace('"', '\\"')
+    tokens = _tokenize(q_escaped)
+
+    if not tokens:
+        expr = f'text like "%{q_escaped}%"'
+    else:
+        # OR: si aparece alguna palabra ya vale como candidato
+        parts = []
+        for t in tokens:
+            safe_t = t.replace('"', '\\"')
+            parts.append(f'text like "%{safe_t}%"')
+        expr = " or ".join(parts)
+
+    docs = col.query(
+        expr=expr,
+        output_fields=["id", "text", "meta"],
+        limit=limit
+    )
+
+    # Ranking léxico simple (en Python): cuenta ocurrencias de tokens
+    if tokens:
+        def lex_score(d: dict) -> int:
+            txt = (d.get("text") or "").lower()
+            return sum(txt.count(t) for t in tokens)
+
+        docs.sort(key=lambda d: lex_score(d), reverse=True)
+
+    return docs
+
+
+def _semantic_candidates(col: Collection, query: str, limit: int) -> list[dict]:
+    qvec = embed(query)
+    results = col.search(
+        data=[qvec],
+        anns_field="embedding",
+        param={"metric_type": "COSINE", "params": {"ef": 64}},
+        limit=limit,
+        output_fields=["id", "text", "meta"]
+    )
+
+    hits: list[dict] = []
+    for h in results[0]:
+        hits.append({
+            "id": h.entity.get("id"),
+            "text": h.entity.get("text"),
+            "meta": h.entity.get("meta"),
+            "semantic_score": float(h.score),
+        })
+    return hits
+
+
+def _rrf_fuse(
+    lexical_docs: list[dict],
+    semantic_docs: list[dict],
+    top_k: int,
+    rrf_k: int = 60
+) -> list[dict]:
+    """
+    Reciprocal Rank Fusion:
+    score(d) = Σ 1 / (rrf_k + rank_i(d))
+    """
+    fused: dict[int, dict] = {}
+
+    # ranks empiezan en 1
+    for rank, d in enumerate(lexical_docs, start=1):
+        doc_id = int(d["id"])
+        entry = fused.setdefault(doc_id, {
+            "id": doc_id,
+            "text": d.get("text"),
+            "meta": d.get("meta"),
+            "lexical_rank": None,
+            "semantic_rank": None,
+            "lexical_score": 0.0,
+            "semantic_score": None,
+            "rrf_score": 0.0,
+        })
+        entry["lexical_rank"] = rank
+        entry["lexical_score"] += 1.0 / (rrf_k + rank)
+        entry["rrf_score"] += 1.0 / (rrf_k + rank)
+
+    for rank, d in enumerate(semantic_docs, start=1):
+        doc_id = int(d["id"])
+        entry = fused.setdefault(doc_id, {
+            "id": doc_id,
+            "text": d.get("text"),
+            "meta": d.get("meta"),
+            "lexical_rank": None,
+            "semantic_rank": None,
+            "lexical_score": 0.0,
+            "semantic_score": None,
+            "rrf_score": 0.0,
+        })
+        entry["semantic_rank"] = rank
+        entry["semantic_score"] = d.get("semantic_score")
+        entry["rrf_score"] += 1.0 / (rrf_k + rank)
+
+        # si el doc ya existía por lexical pero le faltaban campos, rellena
+        if entry.get("text") is None:
+            entry["text"] = d.get("text")
+        if entry.get("meta") is None:
+            entry["meta"] = d.get("meta")
+
+    # orden final por rrf_score desc
+    ordered = sorted(fused.values(), key=lambda x: x["rrf_score"], reverse=True)
+    return ordered[:top_k]
 
 
 # ---------- Endpoints ----------
@@ -211,40 +335,44 @@ def search_semantic(req: SearchRequest):
 @app.post("/search/hybrid")
 def search_hybrid(req: SearchRequest):
     col = get_or_create_collection()
-    q = req.query.replace('"', '\\"')
 
-    candidates = col.query(
-        expr=f'text like "%{q}%"',
-        output_fields=["id"],
-        limit=max(req.top_k * 5, 20)
-    )
-    ids = [c["id"] for c in candidates]
-    if not ids:
-        return {"ok": True, "type": "hybrid", "results": [], "candidate_count": 0}
+    # cuántos candidatos cogemos por cada ranking
+    per_list = max(req.top_k * RRF_CANDIDATES_MULT, 20)
 
-    # embed() también aquí (consistencia)
-    qvec = embed(req.query)
-    expr_ids = f"id in {ids}"
+    lexical_docs = _lexical_candidates(col, req.query, limit=per_list)
+    semantic_docs = _semantic_candidates(col, req.query, limit=per_list)
 
-    results = col.search(
-        data=[qvec],
-        anns_field="embedding",
-        param={"metric_type": "COSINE", "params": {"ef": 64}},
-        limit=req.top_k,
-        expr=expr_ids,
-        output_fields=["id", "text", "meta"]
+    fused = _rrf_fuse(
+        lexical_docs=lexical_docs,
+        semantic_docs=semantic_docs,
+        top_k=req.top_k,
+        rrf_k=RRF_K
     )
 
-    hits = []
-    for h in results[0]:
-        hits.append({
-            "id": h.entity.get("id"),
-            "text": h.entity.get("text"),
-            "meta": h.entity.get("meta"),
-            "score": float(h.score),
+    # Por compatibilidad, devolvemos "score" como el score final (RRF)
+    results = []
+    for d in fused:
+        results.append({
+            "id": d["id"],
+            "text": d.get("text"),
+            "meta": d.get("meta"),
+            "score": float(d["rrf_score"]),          # score final
+            "rrf_score": float(d["rrf_score"]),
+            "semantic_score": d.get("semantic_score"),
+            "lexical_score": float(d.get("lexical_score", 0.0)),
+            "lexical_rank": d.get("lexical_rank"),
+            "semantic_rank": d.get("semantic_rank"),
         })
 
-    return {"ok": True, "type": "hybrid", "candidate_count": len(ids), "results": hits}
+    return {
+        "ok": True,
+        "type": "hybrid_rrf",
+        "rrf_k": RRF_K,
+        "per_list_candidates": per_list,
+        "lexical_count": len(lexical_docs),
+        "semantic_count": len(semantic_docs),
+        "results": results
+    }
 
 @app.delete("/documents/{doc_id}")
 def delete_document(doc_id: int):
